@@ -4,8 +4,8 @@ from pathlib import Path
 
 from agent_advanced import AdvancedAgent
 from agent_baseline import BaselineAgent
-from config import LabConfig
-from memory_store import UserProfileStore
+from config import LabConfig, load_config
+from memory_store import UserProfileStore, is_query_message
 from model_provider import ProviderConfig
 
 
@@ -127,11 +127,6 @@ def test_compact_reduces_prompt_load_on_long_thread(tmp_path: Path) -> None:
 
     assert advanced.compaction_count(thread_id) > 0
     assert advanced.prompt_token_usage(thread_id) < baseline.prompt_token_usage(thread_id)
-
-
-# =====================================================================
-# HARDENING & EXTENDED VERIFICATION TESTS
-# =====================================================================
 
 
 def test_baseline_recalls_within_same_thread(tmp_path: Path) -> None:
@@ -263,3 +258,78 @@ def test_compact_summary_supports_old_context_recall(tmp_path: Path) -> None:
     reply_lower = res["reply"].lower()
 
     assert any(term in reply_lower for term in ["readiness", "dependency", "artemis"])
+
+
+def test_statements_are_not_misclassified_as_queries(tmp_path: Path) -> None:
+    """Verify affirmative user statements are not misclassified as queries and update memory."""
+    config = make_config(tmp_path)
+    advanced = AdvancedAgent(config=config, force_offline=True)
+    baseline = BaselineAgent(config=config, force_offline=True)
+    user_id = "test_statements"
+
+    statements = [
+        "Đồ uống yêu thích của mình là cà phê sữa đá.",
+        "Món ăn yêu thích của mình là mì Quảng.",
+        "Nghề hiện tại của mình là MLOps engineer.",
+        "Nơi ở hiện tại của mình là Huế.",
+    ]
+
+    for stmt in statements:
+        # 1. Statement must NOT be flagged as a query
+        assert is_query_message(stmt) is False
+
+        # 2. Baseline should acknowledge rather than say 'không có thông tin'
+        base_res = baseline.reply(user_id, "thread-base", stmt)
+        assert "không có thông tin" not in base_res["reply"]
+        assert "đã nhận được" in base_res["reply"]
+
+        # 3. Advanced should extract and store the facts
+        advanced.reply(user_id, "thread-adv", stmt)
+
+    facts = advanced.profile_store.facts(user_id)
+    assert facts.get("favorite_drink") == "cà phê sữa đá"
+    assert facts.get("favorite_food") == "mì Quảng"
+    assert facts.get("profession") == "MLOps engineer"
+    assert facts.get("location") == "Huế"
+
+
+def test_mixed_assertion_and_question_preserves_assertion(tmp_path: Path) -> None:
+    """Verify statements containing both an assertion and a question preserve the assertion without leaking question content."""
+    config = make_config(tmp_path)
+    agent = AdvancedAgent(config=config, force_offline=True)
+    user_id = "test_mixed"
+
+    # Message 1: Contains location assertion and question about profession
+    agent.reply(
+        user_id,
+        "thread-mixed-1",
+        "Mình vẫn ở Huế nhé, bạn có nhớ nghề của mình không?",
+    )
+    facts1 = agent.profile_store.facts(user_id)
+    assert facts1.get("location") == "Huế"
+    assert "profession" not in facts1
+
+    # Message 2: Contains profession assertion and question about location
+    agent.reply(
+        user_id,
+        "thread-mixed-2",
+        "Mình vẫn làm MLOps engineer nhé, bạn còn nhớ mình ở đâu không?",
+    )
+    facts2 = agent.profile_store.facts(user_id)
+    assert facts2.get("profession") == "MLOps engineer"
+
+
+def test_provider_api_key_resolution(monkeypatch, tmp_path: Path) -> None:
+    """Verify provider-specific environment variables map to the correct model config."""
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key-secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key-secret")
+    monkeypatch.setenv("JUDGE_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key-secret")
+
+    cfg = load_config(tmp_path)
+
+    assert cfg.model.provider == "gemini"
+    assert cfg.model.api_key == "gemini-key-secret"
+    assert cfg.judge_model.provider == "anthropic"
+    assert cfg.judge_model.api_key == "anthropic-key-secret"

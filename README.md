@@ -35,7 +35,7 @@ Sau khi hoàn thành, các bạn cần có khả năng:
 ├── data/            # dữ liệu benchmark dùng chung
 │   ├── conversations.json
 │   └── advanced_long_context.json
-└── src/             # bản scaffold dành cho sinh viên (pseudocode + TODO)
+└── src/             # implementation của memory layer, Baseline/Advanced Agent, benchmark và tests
     ├── model_provider.py
     ├── config.py
     ├── memory_store.py
@@ -193,33 +193,33 @@ Track này được thiết kế để các bạn không chỉ “dùng agent”
 
 | Agent | Agent tokens only | Prompt tokens processed | Cross-session recall | Response quality | Memory growth (bytes) | Compactions |
 |---|---|---|---|---|---|---|
-| **Baseline** | 1,943 | 16,080 | 0.00 | 0.25 | 0 | 0 |
-| **Advanced** | 2,743 | 24,426 | 1.00 | 1.00 | 268 | 0 |
+| **Baseline** | 1,888 | 15,874 | 0.00 | 0.25 | 0 | 0 |
+| **Advanced** | 2,632 | 23,858 | 1.00 | 1.00 | 268 | 0 |
 
 #### Long-Context Stress Benchmark (`data/advanced_long_context.json` - 16 turns dài, user `dungct_stress`)
 
 | Agent | Agent tokens only | Prompt tokens processed | Cross-session recall | Response quality | Memory growth (bytes) | Compactions |
 |---|---|---|---|---|---|---|
-| **Baseline** | 393 | 24,447 | 0.00 | 0.25 | 0 | 0 |
-| **Advanced** | 780 | 10,618 | 1.00 | 1.00 | 184 | 8 |
+| **Baseline** | 380 | 24,369 | 0.00 | 0.25 | 0 | 0 |
+| **Advanced** | 991 | 10,178 | 1.00 | 1.00 | 184 | 9 |
 
 ---
 
 ### 2. Phân tích chi tiết hành vi và Trade-offs
 
 #### 2.1. Khả năng nhớ Cross-Session & Vai trò của `User.md`
-- **Baseline Agent (Recall = 0.00)**: Chỉ quản lý bộ nhớ cục bộ theo `thread_id` (`within-session memory`). Khi bước sang một `fresh_thread_id` để đánh giá recall, Baseline không có quyền truy cập vào các ngữ cảnh lịch sử trước đó và buộc phải trả lời rằng không có thông tin người dùng.
+- **Baseline Agent (Recall = 0.00)**: Chỉ quản lý bộ nhớ cục bộ theo `thread_id` (`within-session memory`). Khi bước sang một `fresh_thread_id` để đánh giá recall, Baseline không có quyền truy cập vào các ngữ cảnh lịch sử trước đó và trả lời rằng không có thông tin người dùng trong phiên này.
 - **Advanced Agent (Recall = 1.00)**: Sở hữu tầng lưu trữ bền vững (`persistent memory`) tách biệt tại `state/profiles/<user_id>/User.md`. Dù bước sang bất kỳ thread mới nào, agent đều tự động nạp `User.md` vào prompt context, cho phép truy xuất chính xác 100% các thực thể thông tin cốt lõi (tên, nơi ở, nghề nghiệp, đồ uống/món ăn yêu thích, thú cưng, phong cách phản hồi).
 
 #### 2.2. Chi phí ngữ cảnh ở hội thoại ngắn (Overhead Trade-off)
-- Ở bộ **Standard Benchmark** (các hội thoại ngắn ~10 lượt), Advanced Agent tốn nhiều `Prompt tokens processed` hơn Baseline (24,426 so với 16,080).
-- **Lý do**: Ở mỗi lượt trò chuyện, Advanced Agent chủ động nạp thêm cấu trúc markdown `User.md` vào prompt context. Với hội thoại ngắn, overhead của persistent profile chiếm tỷ trọng đáng kể so với dung lượng tin nhắn ngắn, dẫn đến chi phí prompt cao hơn ~51.9%. Đây là chi phí đánh đổi tất yếu (trade-off) để đạt được độ chính xác recall tuyệt đối qua các phiên làm việc.
+- Ở bộ **Standard Benchmark** (các hội thoại ngắn ~10 lượt), Advanced Agent tốn nhiều `Prompt tokens processed` hơn Baseline (23,858 so với 15,874).
+- **Lý do**: Ở mỗi lượt trò chuyện, Advanced Agent chủ động nạp thêm cấu trúc markdown `User.md` vào prompt context. Với hội thoại ngắn, overhead của persistent profile chiếm tỷ trọng đáng kể so với dung lượng tin nhắn ngắn, dẫn đến chi phí prompt cao hơn ~50.3%. Đây là chi phí đánh đổi kỹ thuật (trade-off) để đạt được độ chính xác recall cao qua các phiên làm việc.
 
 #### 2.3. Tác động của Compact Memory trong Long-Context Stress
 - Ở bộ **Long-Context Stress Benchmark**, dữ liệu gồm 16 lượt trao đổi chuyên sâu với dung lượng ngữ cảnh rất lớn (các bài báo NASA, WMO, BC Energy).
-- **Baseline Agent**: Không nén lịch sử, kéo theo toàn bộ tin nhắn từ đầu đến cuối qua từng lượt. Hệ quả là `Prompt tokens processed` tăng theo cấp số cộng lũy tiến, chạm mốc **24,447 tokens**.
-- **Advanced Agent**: `CompactMemoryManager` tự động kích hoạt **8 lần compaction** khi tổng token vượt ngưỡng `compact_threshold_tokens` (800 tokens). Toàn bộ tin nhắn cũ được tóm tắt thành các trừu tượng khái quát (abstractions: Artemis III readiness, X-59 externality, WMO risk communication, BC Energy demand-side efficiency) và chỉ giữ lại `compact_keep_messages` (4 tin nhắn) gần nhất.
-- **Kết quả**: `Prompt tokens processed` giảm từ 24,447 xuống chỉ còn **10,618 tokens** (tiết kiệm **~56.6% chi phí prompt**), chứng minh rõ ràng: *compact memory giải quyết triệt để bài toán phình to ngữ cảnh trong hội thoại dài*.
+- **Baseline Agent**: Không nén lịch sử, kéo theo toàn bộ tin nhắn từ đầu đến cuối qua từng lượt. Hệ quả là `Prompt tokens processed` tăng theo cấp số cộng lũy tiến, chạm mốc **24,369 tokens**.
+- **Advanced Agent**: `CompactMemoryManager` tự động kích hoạt **9 lần compaction** khi tổng token vượt ngưỡng `compact_threshold_tokens` (800 tokens). Toàn bộ tin nhắn cũ được tóm tắt thành các trừu tượng khái quát (abstractions: Artemis III readiness, X-59 externality, WMO risk communication, BC Energy demand-side efficiency) và chỉ giữ lại `compact_keep_messages` (4 tin nhắn) gần nhất.
+- **Kết quả**: `Prompt tokens processed` giảm từ 24,369 xuống còn **10,178 tokens** (tiết kiệm **~58.2% chi phí prompt**), chứng minh rõ ràng: *compact memory giải quyết hiệu quả bài toán phình to ngữ cảnh trong hội thoại dài*.
 
 ---
 
@@ -232,7 +232,7 @@ Việc duy trì bộ nhớ dài hạn tiềm ẩn nhiều rủi ro trong môi tr
 4. **Conflicting facts**: Lưu đồng thời hai giá trị mâu thuẫn cho cùng một thuộc tính (vừa ở Huế vừa ở Đà Nẵng).
 
 #### Các cơ chế bảo vệ đã triển khai (Bonus Features):
-- **Bonus A - Confidence Threshold (`CONFIDENCE_THRESHOLD = 0.70`)**: Chỉ các ứng viên fact có độ tin cậy cao từ các mẫu câu khẳng định mạnh (`mình tên là`, `đính chính`, `giờ mình đang`, `không còn làm... nữa`) mới được lưu vào `User.md`. Các câu hỏi, giả định, hoặc câu nói đùa bị loại bỏ triệt để.
-- **Bonus B - Conflict Handling**: Tự động ghi đè giá trị mới nhất lên trường dữ liệu tương ứng khi có đính chính (Đà Nẵng -> Huế ở Standard; Huế -> Đà Nẵng ở Stress; backend engineer -> MLOps engineer), đảm bảo không bao giờ tồn tại đồng thời hai giá trị mâu thuẫn.
+- **Bonus A - Confidence Threshold (`CONFIDENCE_THRESHOLD = 0.70`)**: Chỉ các ứng viên fact có độ tin cậy cao từ các mệnh đề khẳng định rõ ràng (`mình tên là`, `đính chính`, `giờ mình đang`, `không còn làm... nữa`) mới được lưu vào `User.md`. Các câu hỏi nghi vấn, giả định, hoặc câu nói đùa được giảm thiểu tối đa rủi ro nhận nhầm.
+- **Bonus B - Conflict Handling**: Tự động ghi đè giá trị mới nhất lên trường dữ liệu tương ứng khi có đính chính (Đà Nẵng -> Huế ở Standard; Huế -> Đà Nẵng ở Stress; backend engineer -> MLOps engineer), theo cơ chế ưu tiên fact cập nhật mới nhất.
 - **Bonus C - Structured Entity Extraction**: Chuẩn hóa thông tin thành các thực thể có cấu trúc định danh rõ ràng (`name`, `location`, `profession`, `favorite_drink`, `favorite_food`, `pet`, `response_style`, `interests`).
-- **Bonus D - Memory Growth Guardrail**: Thiết lập giới hạn trần `MAX_PROFILE_FACTS = 25` cho `User.md` và deduplicate nội dung tóm tắt trong `CompactMemoryManager` (tối đa 8 dòng abstraction), ngăn chặn triệt để tình trạng memory leak hoặc phình to không kiểm soát.
+- **Bonus D - Memory Growth Guardrail**: Thiết lập giới hạn trần `MAX_PROFILE_FACTS = 25` cho `User.md` và deduplicate nội dung tóm tắt trong `CompactMemoryManager` (tối đa 8 dòng abstraction), ngăn chặn rủi ro phình to file bộ nhớ không kiểm soát.

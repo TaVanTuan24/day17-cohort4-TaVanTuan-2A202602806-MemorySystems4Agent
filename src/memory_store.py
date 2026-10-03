@@ -137,13 +137,13 @@ class UserProfileStore:
 
 
 def is_recall_or_question(text: str) -> bool:
-    """Check if a clause or sentence is a question, recall prompt, or hypothetical test.
+    """Check if a sub-clause or segment is a question, recall prompt, or inquiry.
 
     Used to prevent memory leakage from questions such as:
     - 'Mình có thích cà phê sữa đá không?'
     - 'Món ăn yêu thích của mình là gì?'
     - 'Bạn biết DũngCT là ai không?'
-    - 'Nhắc lại style trả lời mình thích.'
+    - 'bạn có nhớ nghề của mình không?'
     """
     if not text:
         return False
@@ -164,6 +164,9 @@ def is_recall_or_question(text: str) -> bool:
         r"\bnhắc lại\b",
         r"\btóm tắt\b",
         r"\bbạn có thể nhắc\b",
+        r"\bbạn có nhớ\b",
+        r"\bbạn còn nhớ\b",
+        r"\bcòn nhớ\b",
         r"\bbạn có biết\b",
         r"\bbạn biết [a-z0-9à-ỹ\s]+ là ai không\b",
         r"\bbạn biết [a-z0-9à-ỹ\s]+ không\b",
@@ -179,8 +182,9 @@ def is_recall_or_question(text: str) -> bool:
 def is_query_message(message: str) -> bool:
     """Determine whether an entire incoming message is an inquiry or recall request.
 
-    Avoids false positives from isolated substrings like 'ai' (in 'AI ứng dụng')
-    or 'ở' (in 'ở Đà Nẵng').
+    Requires explicit query grammar or question intent. Standalone noun phrases
+    (such as 'đồ uống yêu thích', 'nơi ở hiện tại') without question markers
+    are treated as statements.
     """
     if not message:
         return False
@@ -196,28 +200,31 @@ def is_query_message(message: str) -> bool:
         r"\bmình là ai\b",
         r"\blà ai\b",
         r"\bở đâu\b",
-        r"\bnơi ở hiện tại\b",
+        r"\bhiện đang ở đâu\b",
         r"\bnghề gì\b",
         r"\blàm nghề gì\b",
-        r"\bnghề hiện tại\b",
-        r"\bcông việc hiện tại\b",
+        r"\blàm gì\b",
+        r"\b(nghề|công việc)( hiện tại)?( của mình)? là gì\b",
+        r"\b(món ăn|đồ uống)( yêu thích)?( của mình)? là gì\b",
+        r"\b(món ăn|đồ uống) yêu thích là gì\b",
+        r"\bthú cưng( của mình)? là gì\b",
+        r"\bnuôi con gì\b",
         r"\bnhắc lại\b",
         r"\btóm tắt\b",
         r"\bstyle .+ như thế nào\b",
-        r"\bkiểu trả lời\b",
+        r"\bkiểu trả lời như thế nào\b",
         r"\btrả lời như thế nào\b",
-        r"\bmón ăn yêu thích\b",
-        r"\bđồ uống yêu thích\b",
-        r"\bnuôi con gì\b",
-        r"\bthú cưng\b",
         r"\bchọn giữa\b",
         r"\bphải không\b",
         r"\bđúng không\b",
         r"\bcó nhớ\b",
+        r"\bbạn có nhớ\b",
+        r"\bbạn còn nhớ\b",
         r"\bbạn có biết\b",
         r"\bnhớ lại xem\b",
         r"\bđâu mới là\b",
         r"\bpattern gì\b",
+        r"\bđại diện cho pattern gì\b",
         r"\bđại diện cho\b",
         r"\bchủ đề gì\b",
     ]
@@ -229,17 +236,26 @@ def extract_profile_updates(message: str) -> dict[str, str]:
 
     Guarantees:
     - Never extracts facts from question/recall clauses.
+    - Handles mixed messages: extracts assertions from assertion clauses while ignoring question clauses.
     - Handles corrections: Đà Nẵng -> Huế, Huế -> Đà Nẵng, backend -> MLOps.
     - Filters intentional noise: product manager joke, Hanoi business trip transit.
-    - Supports mixed messages: extracts assertions from assertion clauses while ignoring question clauses.
     """
     candidates: list[FactCandidate] = []
     text = message.strip()
     full_lower = text.lower()
 
-    # Split message into clauses/sentences to isolate assertions from questions
-    raw_clauses = re.split(r"[.\n;!]+", text)
-    clauses = [cl.strip() for cl in raw_clauses if cl.strip()]
+    # Split message into sentences, then decompose mixed sentences (by comma or question boundary)
+    raw_sentences = re.split(r"[.\n;!]+", text)
+    segments: list[str] = []
+    for s in raw_sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+        sub_parts = re.split(r"[,?]+", s_clean)
+        for sp in sub_parts:
+            sp_clean = sp.strip()
+            if sp_clean:
+                segments.append(sp_clean)
 
     # Global noise markers
     is_hanoi_noise = "hà nội" in full_lower and any(
@@ -249,7 +265,7 @@ def extract_profile_updates(message: str) -> dict[str, str]:
         w in full_lower for w in ["câu đùa", "đùa", "hay là chuyển sang", "cho đỡ"]
     )
 
-    for cl in clauses:
+    for cl in segments:
         cl_lower = cl.lower()
 
         # If this clause is a question or recall challenge, DO NOT extract facts from it!
@@ -293,19 +309,22 @@ def extract_profile_updates(message: str) -> dict[str, str]:
             "giờ mình đang ở huế chứ không còn ở đà nẵng" in cl_lower
             or ("đính chính" in full_lower and "ở huế" in cl_lower and "đà nẵng" in cl_lower)
             or "mình vẫn ở huế" in cl_lower
+            or "vẫn ở huế" in cl_lower
             or "bạn nhớ là mình đang ở huế" in cl_lower
             or "vẫn ở huế, chưa chuyển đi" in cl_lower
         ):
             candidates.append(FactCandidate("location", "Huế", 0.98))
         elif not is_hanoi_noise:
             if (
-                "ở đà nẵng" in cl_lower
+                "đà nẵng" in cl_lower
+                and any(w in cl_lower for w in ["nơi ở hiện tại", "ở đà nẵng", "là đà nẵng", "mình ở đà nẵng"])
                 and "không còn ở đà nẵng" not in full_lower
                 and "đừng lấy nó làm nơi ở" not in full_lower
             ):
-                candidates.append(FactCandidate("location", "Đà Nẵng", 0.85))
+                candidates.append(FactCandidate("location", "Đà Nẵng", 0.90))
             elif (
-                "ở huế" in cl_lower
+                "huế" in cl_lower
+                and any(w in cl_lower for w in ["nơi ở hiện tại", "ở huế", "là huế", "mình ở huế", "đang ở huế"])
                 and "từ huế sang" not in full_lower
                 and "không còn ở" not in cl_lower
             ):
@@ -316,9 +335,12 @@ def extract_profile_updates(message: str) -> dict[str, str]:
             "chuyển sang mlops engineer" in cl_lower
             or "không còn làm backend engineer nữa, giờ chuyển sang mlops engineer" in cl_lower
             or "nghề nghiệp hiện tại vẫn là mlops engineer" in cl_lower
+            or "nghề hiện tại của mình là mlops engineer" in cl_lower
+            or "nghề hiện tại là mlops engineer" in cl_lower
             or "làm mlops engineer" in cl_lower
             or "nghề mlops engineer" in cl_lower
             or ("mlops engineer" in cl_lower and "đừng nói backend engineer" in full_lower)
+            or ("mlops engineer" in cl_lower and any(w in cl_lower for w in ["nghề", "làm", "công việc", "chuyển sang"]))
         ):
             candidates.append(FactCandidate("profession", "MLOps engineer", 0.99))
         elif is_pm_joke:
@@ -333,17 +355,17 @@ def extract_profile_updates(message: str) -> dict[str, str]:
 
         # 4. Favorite drink
         if "cà phê sữa đá" in cl_lower or "ca phe sua da" in cl_lower:
-            if any(w in cl_lower for w in ["thích", "yêu thích", "uống"]):
+            if any(w in cl_lower for w in ["thích", "yêu thích", "uống", "đồ uống"]):
                 candidates.append(FactCandidate("favorite_drink", "cà phê sữa đá", 0.95))
 
         # 5. Favorite food
         if "mì quảng" in cl_lower or "mi quang" in cl_lower:
-            if any(w in cl_lower for w in ["yêu thích", "món ruột", "món ăn", "ăn"]):
+            if any(w in cl_lower for w in ["yêu thích", "món ruột", "món ăn", "ăn", "thích"]):
                 candidates.append(FactCandidate("favorite_food", "mì Quảng", 0.95))
 
         # 6. Pet
         if "corgi" in cl_lower or "bơ" in cl_lower:
-            if any(w in cl_lower for w in ["nuôi", "con corgi", "bé corgi", "con bơ"]):
+            if any(w in cl_lower for w in ["nuôi", "con corgi", "bé corgi", "con bơ", "thú cưng"]):
                 candidates.append(FactCandidate("pet", "corgi tên Bơ", 0.95))
 
         # 7. Response style
