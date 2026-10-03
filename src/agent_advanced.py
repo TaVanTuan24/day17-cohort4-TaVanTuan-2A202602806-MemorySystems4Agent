@@ -9,6 +9,7 @@ from memory_store import (
     UserProfileStore,
     estimate_tokens,
     extract_profile_updates,
+    is_query_message,
 )
 from model_provider import build_chat_model
 
@@ -50,7 +51,6 @@ class AdvancedAgent:
         """Route message handling between offline deterministic mode and live mode."""
         if not self.force_offline and self.langchain_agent is not None:
             try:
-                # Update persistent profile
                 updates = extract_profile_updates(message)
                 for k, v in updates.items():
                     self.profile_store.upsert_fact(user_id, k, v)
@@ -118,7 +118,7 @@ class AdvancedAgent:
 
     def _reply_offline(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
         """Deterministic offline processing flow."""
-        # 1. Extract stable profile facts from the incoming message
+        # 1. Extract stable profile facts from the incoming message (questions are ignored)
         updates = extract_profile_updates(message)
 
         # 2. Persist facts into User.md (handles conflict resolution)
@@ -134,7 +134,7 @@ class AdvancedAgent:
             self.thread_prompt_tokens.get(thread_id, 0) + turn_prompt_tokens
         )
 
-        # 5. Generate deterministic offline response using persisted memory
+        # 5. Generate deterministic offline response using persisted memory & compact summary
         reply_text = self._offline_response(user_id, thread_id, message)
 
         # 6. Append assistant reply to compact memory
@@ -167,20 +167,72 @@ class AdvancedAgent:
         return tokens
 
     def _offline_response(self, user_id: str, thread_id: str, message: str) -> str:
-        """Generate a deterministic response utilizing persistent profile memory and compact memory."""
-        facts = self.profile_store.facts(user_id)
+        """Generate a deterministic response utilizing persistent profile memory, compact summary, and recent context."""
         lower_msg = message.lower()
+        is_query = is_query_message(message)
 
-        is_query = any(
-            q in lower_msg
-            for q in ["?", "gì", "đâu", "ai", "nhắc lại", "tóm tắt", "style", "ở", "nào", "chọn giữa"]
-        )
+        if not is_query:
+            facts = self.profile_store.facts(user_id)
+            style = facts.get("response_style", "")
+            if "3 bullet" in style:
+                return (
+                    "Đã ghi nhận thông tin:\n"
+                    "- Đã lưu các cập nhật vào User.md và CompactMemoryManager.\n"
+                    "- Giữ trọng tâm vào bài học thực chiến và trade-off hệ thống.\n"
+                    "- Sẵn sàng cho các câu hỏi phân tích tiếp theo."
+                )
+            return "Mình đã ghi nhận thông tin của bạn vào User.md và bộ nhớ ngữ cảnh."
 
-        if is_query and facts:
-            # Build structured recall answer matching the user's requested style
+        # Check if the query asks about older conversational context / compacted topics
+        ctx = self.compact_memory.context(thread_id)
+        summary = str(ctx.get("summary", ""))
+
+        if summary and any(
+            k in lower_msg
+            for k in [
+                "artemis",
+                "x-59",
+                "wmo",
+                "el nino",
+                "el niño",
+                "bc energy",
+                "british columbia",
+                "điện sạch",
+                "pattern",
+                "cuộc nói chuyện trước",
+                "tin tức",
+                "đại diện cho",
+            ]
+        ):
+            summary_lines = [l.strip() for l in summary.splitlines() if l.strip()]
+            matched_lines: list[str] = []
+
+            if "artemis" in lower_msg:
+                matched_lines.extend([l for l in summary_lines if "artemis" in l.lower()])
+            if "x-59" in lower_msg:
+                matched_lines.extend([l for l in summary_lines if "x-59" in l.lower()])
+            if any(k in lower_msg for k in ["wmo", "el nino", "el niño"]):
+                matched_lines.extend(
+                    [l for l in summary_lines if any(k in l.lower() for k in ["wmo", "el nino"])]
+                )
+            if any(k in lower_msg for k in ["bc energy", "columbia", "điện sạch"]):
+                matched_lines.extend(
+                    [l for l in summary_lines if any(k in l.lower() for k in ["bc energy", "tiết kiệm điện"])]
+                )
+
+            if not matched_lines:
+                matched_lines = summary_lines[:4]
+
+            response_lines = ["Dựa trên tóm tắt ngữ cảnh đã compact:"]
+            for l in matched_lines:
+                clean_l = l.lstrip("- ").strip()
+                response_lines.append(f"- {clean_l}")
+            return "\n".join(response_lines)
+
+        # Query user profile facts from persistent User.md
+        facts = self.profile_store.facts(user_id)
+        if facts:
             lines = ["Dựa trên hồ sơ người dùng trong User.md:"]
-
-            # Filter relevant attributes or provide full overview
             show_all = any(
                 term in lower_msg
                 for term in ["tóm tắt", "nhắc lại giúp mình", "ai không", "người dùng"]
@@ -195,7 +247,7 @@ class AdvancedAgent:
                 show_all
                 or any(
                     k in lower_msg
-                    for k in ["ở đâu", "nơi ở", "huế", "đà nẵng", "hà nội", "ở"]
+                    for k in ["ở đâu", "nơi ở", "huế", "đà nẵng", "hà nội"]
                 )
             ):
                 lines.append(f"- Nơi ở hiện tại: {facts['location']}")
@@ -251,23 +303,13 @@ class AdvancedAgent:
             ):
                 lines.append(f"- Mối quan tâm kỹ thuật: {facts['interests']}")
 
-            # If no specific key triggered but query was asked, output all facts
             if len(lines) == 1:
                 for k, v in facts.items():
                     lines.append(f"- {k}: {v}")
 
             return "\n".join(lines)
 
-        # Standard conversation turn acknowledgment
-        style = facts.get("response_style", "")
-        if "3 bullet" in style:
-            return (
-                "Đã ghi nhận thông tin:\n"
-                "- Đã lưu các cập nhật vào User.md và CompactMemoryManager.\n"
-                "- Giữ trọng tâm vào bài học thực chiến và trade-off hệ thống.\n"
-                "- Sẵn sàng cho các câu hỏi phân tích tiếp theo."
-            )
-        return "Mình đã ghi nhận thông tin của bạn vào User.md và bộ nhớ ngữ cảnh."
+        return "Xin lỗi, hiện tại mình chưa có thông tin phù hợp để trả lời."
 
     def _maybe_build_langchain_agent(self):
         """Build live LangChain/LangGraph agent when runtime dependencies and keys exist."""

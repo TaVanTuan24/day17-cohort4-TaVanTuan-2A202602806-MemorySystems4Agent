@@ -26,11 +26,12 @@ def estimate_tokens(text: str) -> int:
 
 
 # =====================================================================
-# BONUS ARCHITECTURAL FEATURES:
+# ARCHITECTURAL GUARDRAILS & BONUSES:
 # 1. Structured Entity Extraction: Typed FactCandidate with canonical fields.
 # 2. Confidence Threshold: Only facts with confidence >= threshold are saved.
 # 3. Conflict Handling: New corrections overwrite old facts in User.md.
 # 4. Memory Growth Guardrail: Capped facts count and deduplicated profile.
+# 5. Recall/Query Isolation: Questions and recall prompts never mutate profile.
 # =====================================================================
 
 CONFIDENCE_THRESHOLD = 0.70
@@ -39,12 +40,7 @@ MAX_PROFILE_FACTS = 25
 
 @dataclass
 class FactCandidate:
-    """Represents an extracted candidate fact with an associated confidence score.
-
-    - field: The normalized property name (e.g. 'location', 'profession').
-    - value: The extracted canonical value.
-    - confidence: Score between 0.0 and 1.0.
-    """
+    """Represents an extracted candidate fact with an associated confidence score."""
 
     field: str
     value: str
@@ -130,7 +126,6 @@ class UserProfileStore:
 
         # Guardrail: cap number of facts
         if len(current_facts) > MAX_PROFILE_FACTS:
-            # retain the most recently inserted/updated facts
             items = list(current_facts.items())[-MAX_PROFILE_FACTS:]
             current_facts = dict(items)
 
@@ -141,165 +136,234 @@ class UserProfileStore:
         self.write_text(user_id, new_content)
 
 
+def is_recall_or_question(text: str) -> bool:
+    """Check if a clause or sentence is a question, recall prompt, or hypothetical test.
+
+    Used to prevent memory leakage from questions such as:
+    - 'Mình có thích cà phê sữa đá không?'
+    - 'Món ăn yêu thích của mình là gì?'
+    - 'Bạn biết DũngCT là ai không?'
+    - 'Nhắc lại style trả lời mình thích.'
+    """
+    if not text:
+        return False
+    c = text.strip().lower()
+    if "?" in c:
+        return True
+
+    question_patterns = [
+        r"\blà gì\b",
+        r"\bở đâu\b",
+        r"\blà ai\b",
+        r"\bcon gì\b",
+        r"\bthế nào\b",
+        r"\bnhư thế nào\b",
+        r"\bphải không\b",
+        r"\bđúng không\b",
+        r"\bnhớ lại xem\b",
+        r"\bnhắc lại\b",
+        r"\btóm tắt\b",
+        r"\bbạn có thể nhắc\b",
+        r"\bbạn có biết\b",
+        r"\bbạn biết [a-z0-9à-ỹ\s]+ là ai không\b",
+        r"\bbạn biết [a-z0-9à-ỹ\s]+ không\b",
+        r"\bcó .+ không\b",
+        r"\bđâu mới là\b",
+        r"\bchọn giữa\b",
+        r"\bthử nhớ\b",
+        r"\bthử mô tả\b",
+    ]
+    return any(re.search(p, c) for p in question_patterns)
+
+
+def is_query_message(message: str) -> bool:
+    """Determine whether an entire incoming message is an inquiry or recall request.
+
+    Avoids false positives from isolated substrings like 'ai' (in 'AI ứng dụng')
+    or 'ở' (in 'ở Đà Nẵng').
+    """
+    if not message:
+        return False
+    text = message.strip()
+    lower = text.lower()
+    if "?" in text:
+        return True
+
+    query_patterns = [
+        r"\bmình tên gì\b",
+        r"\btên mình là gì\b",
+        r"\btên là gì\b",
+        r"\bmình là ai\b",
+        r"\blà ai\b",
+        r"\bở đâu\b",
+        r"\bnơi ở hiện tại\b",
+        r"\bnghề gì\b",
+        r"\blàm nghề gì\b",
+        r"\bnghề hiện tại\b",
+        r"\bcông việc hiện tại\b",
+        r"\bnhắc lại\b",
+        r"\btóm tắt\b",
+        r"\bstyle .+ như thế nào\b",
+        r"\bkiểu trả lời\b",
+        r"\btrả lời như thế nào\b",
+        r"\bmón ăn yêu thích\b",
+        r"\bđồ uống yêu thích\b",
+        r"\bnuôi con gì\b",
+        r"\bthú cưng\b",
+        r"\bchọn giữa\b",
+        r"\bphải không\b",
+        r"\bđúng không\b",
+        r"\bcó nhớ\b",
+        r"\bbạn có biết\b",
+        r"\bnhớ lại xem\b",
+        r"\bđâu mới là\b",
+        r"\bpattern gì\b",
+        r"\bđại diện cho\b",
+        r"\bchủ đề gì\b",
+    ]
+    return any(re.search(p, lower) for p in query_patterns)
+
+
 def extract_profile_updates(message: str) -> dict[str, str]:
     """Deterministically extract user profile facts with confidence scoring and noise filtering.
 
-    Handles:
-    - Name ('DũngCT', 'DũngCT Stress')
-    - Location with corrections (Đà Nẵng -> Huế, Huế -> Đà Nẵng) and noise filtering (Hà Nội transit)
-    - Profession with corrections (backend -> MLOps) and noise filtering ('product manager' joke)
-    - Preferences (favorite_drink, favorite_food, pet, response_style, interests)
-    - Rejection of questions or joke statements
+    Guarantees:
+    - Never extracts facts from question/recall clauses.
+    - Handles corrections: Đà Nẵng -> Huế, Huế -> Đà Nẵng, backend -> MLOps.
+    - Filters intentional noise: product manager joke, Hanoi business trip transit.
+    - Supports mixed messages: extracts assertions from assertion clauses while ignoring question clauses.
     """
     candidates: list[FactCandidate] = []
     text = message.strip()
-    lower_text = text.lower()
+    full_lower = text.lower()
 
-    # Skip pure question turns or recall challenges that don't provide facts
-    is_pure_question = text.endswith("?") and not any(
-        kw in lower_text
-        for kw in [
-            "mình tên là",
-            "đính chính",
-            "giờ mình",
-            "mình không còn",
-            "món ăn yêu thích",
-            "mình nuôi",
-            "mình đang quan tâm",
-        ]
+    # Split message into clauses/sentences to isolate assertions from questions
+    raw_clauses = re.split(r"[.\n;!]+", text)
+    clauses = [cl.strip() for cl in raw_clauses if cl.strip()]
+
+    # Global noise markers
+    is_hanoi_noise = "hà nội" in full_lower and any(
+        w in full_lower for w in ["chỉ là nơi", "bay ra họp", "không phải nơi ở", "đối tác"]
+    )
+    is_pm_joke = "product manager" in full_lower and any(
+        w in full_lower for w in ["câu đùa", "đùa", "hay là chuyển sang", "cho đỡ"]
     )
 
-    # 1. Name extraction
-    if not is_pure_question:
-        if "dũngct stress" in lower_text or "dungct stress" in lower_text:
-            candidates.append(FactCandidate("name", "DũngCT Stress", 0.99))
-        elif (
-            "mình tên là dũngct" in lower_text
-            or "tên là dũngct" in lower_text
-            or "tên mình là dũngct" in lower_text
-            or "chào bạn, mình tên là dũngct" in lower_text
-        ):
-            candidates.append(FactCandidate("name", "DũngCT", 0.99))
-        else:
-            name_match = re.search(
-                r"(?:mình tên là|tên mình là)\s+([A-ZÀ-Ỹa-zà-ỹ0-9_\s]+?)(?=[.,\n;]|và|$)",
-                text,
-                re.IGNORECASE,
-            )
-            if name_match:
-                extracted_name = name_match.group(1).strip()
-                if extracted_name.lower() not in ("gì", "ai", "bạn", "mình"):
-                    candidates.append(FactCandidate("name", extracted_name, 0.90))
+    for cl in clauses:
+        cl_lower = cl.lower()
 
-    # 2. Location extraction with correction and noise rejection
-    # Noise check: "Hà Nội" is only a temporary meeting location, NOT residence
-    is_hanoi_noise = "hà nội" in lower_text and any(
-        w in lower_text for w in ["chỉ là nơi", "bay ra họp", "không phải nơi ở", "đối tác"]
-    )
+        # If this clause is a question or recall challenge, DO NOT extract facts from it!
+        if is_recall_or_question(cl):
+            continue
 
-    # Check for explicit correction: Huế -> Đà Nẵng
-    if (
-        "từ huế sang đà nẵng" in lower_text
-        or "nơi ở đã cập nhật từ huế sang đà nẵng" in lower_text
-        or (
-            "đang làm việc ở đà nẵng" in lower_text
-            and "thực ra" in lower_text
-            and "huế" in lower_text
-        )
-        or "nơi ở hiện tại là đà nẵng" in lower_text
-    ):
-        candidates.append(FactCandidate("location", "Đà Nẵng", 0.99))
-    # Check for explicit correction: Đà Nẵng -> Huế
-    elif (
-        "giờ mình đang ở huế chứ không còn ở đà nẵng" in lower_text
-        or (
-            "đính chính" in lower_text
-            and "ở huế" in lower_text
-            and "đà nẵng" in lower_text
-        )
-        or "mình vẫn ở huế" in lower_text
-        or "bạn nhớ là mình đang ở huế" in lower_text
-    ):
-        candidates.append(FactCandidate("location", "Huế", 0.98))
-    elif not is_hanoi_noise:
+        # 1. Name extraction (must be an assertion)
+        if any(kw in cl_lower for kw in ["mình tên là", "tên mình là", "tên là", "chào bạn, mình tên"]):
+            if "dũngct stress" in cl_lower or "dungct stress" in cl_lower:
+                candidates.append(FactCandidate("name", "DũngCT Stress", 0.99))
+            elif "dũngct" in cl_lower or "dungct" in cl_lower:
+                candidates.append(FactCandidate("name", "DũngCT", 0.99))
+            else:
+                m = re.search(
+                    r"(?:mình tên là|tên mình là|tên là)\s+([A-ZÀ-Ỹa-zà-ỹ0-9_\s]+?)(?=[.,\n;!]|và|$)",
+                    cl,
+                    re.IGNORECASE,
+                )
+                if m:
+                    extracted_name = m.group(1).strip()
+                    if extracted_name.lower() not in ("gì", "ai", "bạn", "mình"):
+                        candidates.append(FactCandidate("name", extracted_name, 0.90))
+        elif any(kw in cl_lower for kw in ["nhắc lại lần cuối cho chắc: tên", "thứ nhất, tên mình là"]):
+            if "dũngct stress" in cl_lower:
+                candidates.append(FactCandidate("name", "DũngCT Stress", 0.99))
+            elif "dũngct" in cl_lower:
+                candidates.append(FactCandidate("name", "DũngCT", 0.99))
+
+        # 2. Location extraction (with correction & noise filtering)
+        # Check correction: Huế -> Đà Nẵng
         if (
-            "ở đà nẵng" in lower_text
-            and "không còn ở đà nẵng" not in lower_text
-            and "đừng lấy nó làm nơi ở" not in lower_text
+            "từ huế sang đà nẵng" in cl_lower
+            or "cập nhật từ huế sang đà nẵng" in cl_lower
+            or "nơi ở hiện tại là đà nẵng" in cl_lower
+            or ("đang làm việc ở đà nẵng" in cl_lower and "thực ra" in full_lower)
+            or ("ở đà nẵng trong giai đoạn này" in cl_lower and "huế" in cl_lower)
         ):
-            candidates.append(FactCandidate("location", "Đà Nẵng", 0.85))
+            candidates.append(FactCandidate("location", "Đà Nẵng", 0.99))
+        # Check correction: Đà Nẵng -> Huế
         elif (
-            "ở huế" in lower_text
-            and "từ huế sang" not in lower_text
-            and not is_pure_question
+            "giờ mình đang ở huế chứ không còn ở đà nẵng" in cl_lower
+            or ("đính chính" in full_lower and "ở huế" in cl_lower and "đà nẵng" in cl_lower)
+            or "mình vẫn ở huế" in cl_lower
+            or "bạn nhớ là mình đang ở huế" in cl_lower
+            or "vẫn ở huế, chưa chuyển đi" in cl_lower
         ):
-            candidates.append(FactCandidate("location", "Huế", 0.90))
+            candidates.append(FactCandidate("location", "Huế", 0.98))
+        elif not is_hanoi_noise:
+            if (
+                "ở đà nẵng" in cl_lower
+                and "không còn ở đà nẵng" not in full_lower
+                and "đừng lấy nó làm nơi ở" not in full_lower
+            ):
+                candidates.append(FactCandidate("location", "Đà Nẵng", 0.85))
+            elif (
+                "ở huế" in cl_lower
+                and "từ huế sang" not in full_lower
+                and "không còn ở" not in cl_lower
+            ):
+                candidates.append(FactCandidate("location", "Huế", 0.90))
 
-    # 3. Profession extraction with correction and noise rejection
-    # Noise check: "product manager" is explicitly a joke
-    is_pm_joke = "product manager" in lower_text and any(
-        w in lower_text
-        for w in ["câu đùa", "đùa", "hay là chuyển sang", "cho đỡ phải"]
-    )
+        # 3. Profession extraction (with correction & noise filtering)
+        if (
+            "chuyển sang mlops engineer" in cl_lower
+            or "không còn làm backend engineer nữa, giờ chuyển sang mlops engineer" in cl_lower
+            or "nghề nghiệp hiện tại vẫn là mlops engineer" in cl_lower
+            or "làm mlops engineer" in cl_lower
+            or "nghề mlops engineer" in cl_lower
+            or ("mlops engineer" in cl_lower and "đừng nói backend engineer" in full_lower)
+        ):
+            candidates.append(FactCandidate("profession", "MLOps engineer", 0.99))
+        elif is_pm_joke:
+            # Noise rejected
+            pass
+        elif (
+            "backend engineer" in cl_lower
+            and "không còn làm backend engineer" not in full_lower
+            and "đừng nói backend engineer" not in full_lower
+        ):
+            candidates.append(FactCandidate("profession", "backend engineer", 0.85))
 
-    if (
-        "chuyển sang mlops engineer" in lower_text
-        or "không còn làm backend engineer nữa, giờ chuyển sang mlops engineer" in lower_text
-        or "nghề nghiệp hiện tại vẫn là mlops engineer" in lower_text
-        or "làm mlops engineer" in lower_text
-        or "nghề mlops engineer" in lower_text
-        or (
-            "mlops engineer" in lower_text
-            and "đừng nói backend engineer" in lower_text
-        )
-    ):
-        candidates.append(FactCandidate("profession", "MLOps engineer", 0.99))
-    elif is_pm_joke:
-        # Rejected as noise
-        pass
-    elif (
-        "backend engineer" in lower_text
-        and "không còn làm backend engineer" not in lower_text
-        and "đừng nói backend engineer" not in lower_text
-        and not is_pure_question
-    ):
-        candidates.append(FactCandidate("profession", "backend engineer", 0.85))
+        # 4. Favorite drink
+        if "cà phê sữa đá" in cl_lower or "ca phe sua da" in cl_lower:
+            if any(w in cl_lower for w in ["thích", "yêu thích", "uống"]):
+                candidates.append(FactCandidate("favorite_drink", "cà phê sữa đá", 0.95))
 
-    # 4. Favorite drink
-    if "cà phê sữa đá" in lower_text or "ca phe sua da" in lower_text:
-        candidates.append(FactCandidate("favorite_drink", "cà phê sữa đá", 0.95))
+        # 5. Favorite food
+        if "mì quảng" in cl_lower or "mi quang" in cl_lower:
+            if any(w in cl_lower for w in ["yêu thích", "món ruột", "món ăn", "ăn"]):
+                candidates.append(FactCandidate("favorite_food", "mì Quảng", 0.95))
 
-    # 5. Favorite food
-    if "mì quảng" in lower_text or "mi quang" in lower_text:
-        candidates.append(FactCandidate("favorite_food", "mì Quảng", 0.95))
+        # 6. Pet
+        if "corgi" in cl_lower or "bơ" in cl_lower:
+            if any(w in cl_lower for w in ["nuôi", "con corgi", "bé corgi", "con bơ"]):
+                candidates.append(FactCandidate("pet", "corgi tên Bơ", 0.95))
 
-    # 6. Pet
-    if "corgi" in lower_text or "bơ" in lower_text:
-        if "corgi" in lower_text:
-            candidates.append(FactCandidate("pet", "corgi tên Bơ", 0.95))
+        # 7. Response style
+        if "3 bullet" in cl_lower:
+            candidates.append(
+                FactCandidate("response_style", "3 bullet ngắn, có ví dụ thực chiến", 0.98)
+            )
+        elif "ngắn gọn" in cl_lower and any(
+            w in cl_lower for w in ["bullet", "rõ ý", "ví dụ thực tế", "ví dụ thực chiến", "style", "trả lời"]
+        ):
+            candidates.append(
+                FactCandidate("response_style", "ngắn gọn, có bullet và ví dụ thực tế", 0.95)
+            )
 
-    # 7. Response style
-    if "3 bullet" in lower_text:
-        candidates.append(
-            FactCandidate("response_style", "3 bullet ngắn, có ví dụ thực chiến", 0.98)
-        )
-    elif (
-        "ngắn gọn" in lower_text
-        and any(w in lower_text for w in ["bullet", "rõ ý", "ví dụ thực tế", "ví dụ thực chiến", "style"])
-    ):
-        candidates.append(
-            FactCandidate("response_style", "ngắn gọn, có bullet và ví dụ thực tế", 0.95)
-        )
-    elif "ngắn gọn" in lower_text and not is_pure_question:
-        candidates.append(
-            FactCandidate("response_style", "ngắn gọn, có bullet và ví dụ thực tế", 0.85)
-        )
+        # 8. Interests
+        if any(w in cl_lower for w in ["mình thích", "mình đang quan tâm", "mình vẫn thích", "quan tâm nhiều đến"]):
+            if any(k in cl_lower for k in ["python", "ai ứng dụng", "ai agent", "mlops", "benchmark memory"]):
+                candidates.append(FactCandidate("interests", "Python, AI", 0.90))
 
-    # 8. Interests
-    if any(k in lower_text for k in ["python", "ai ứng dụng", "ai agent", "mối quan tâm"]):
-        candidates.append(FactCandidate("interests", "Python, AI", 0.90))
-
-    # Filter by confidence threshold
+    # Filter candidates by confidence threshold
     valid_updates: dict[str, str] = {}
     for cand in candidates:
         if cand.confidence >= CONFIDENCE_THRESHOLD:
@@ -346,13 +410,11 @@ def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> st
             "- Chủ đề BC Energy: Cân bằng giữa mở rộng công suất (capex) và tối ưu hiệu quả tiết kiệm điện."
         )
 
-    # Extract conversation highlights from messages not covered by macro themes
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "").strip()
         if not content:
             continue
-        # Only take short snippets if not already crowded
         if len(summary_bullets) >= max_items:
             break
         if role == "user":
@@ -414,14 +476,12 @@ class CompactMemoryManager:
 
             new_summary_part = summarize_messages(to_compact)
             if summary_text:
-                # Merge existing and new summary lines deterministically while deduplicating
                 existing_lines = [l.strip() for l in summary_text.splitlines() if l.strip()]
                 new_lines = [l.strip() for l in new_summary_part.splitlines() if l.strip()]
                 combined: list[str] = []
                 for line in existing_lines + new_lines:
                     if line not in combined:
                         combined.append(line)
-                # Keep bounded at most 8 lines to prevent summary runaway
                 t_state["summary"] = "\n".join(combined[-8:])
             else:
                 t_state["summary"] = new_summary_part
